@@ -239,9 +239,10 @@ def generate_chute_file(revision: str) -> None:
 )
 @click.option(
     "--miner-url",
-    default="http://localhost:8091",
-    show_default=True,
-    help="Base URL of the local miner server.",
+    multiple=True,
+    help="Miner URL (repeatable). "
+    "Example: --miner-url http://localhost:8091 --miner-url http://localhost:8092. "
+    "Defaults to http://localhost:8091 when none given.",
 )
 @click.option(
     "--output-dir",
@@ -269,7 +270,10 @@ def generate_chute_file(revision: str) -> None:
     help="Prediction request timeout in seconds.",
 )
 def local_validate_cmd(challenge, miner_url, output_dir, max_challenges, max_dialogues, timeout):
-    """Run the full local validator flow against a local miner (mainnet-equivalent).
+    """Run the full local validator flow against local miners (mainnet-equivalent).
+
+    Supports multiple miners -- pass --miner-url once per miner.  The same
+    challenge is sent to every miner concurrently, just like mainnet.
 
     When --challenge is omitted, a random challenge is automatically picked
     from the miner-test-data/ directory.
@@ -277,7 +281,7 @@ def local_validate_cmd(challenge, miner_url, output_dir, max_challenges, max_dia
     from babelbit.cli.local_runner import main as run_local
     rc = run_local(
         challenge=challenge,
-        miner_url=miner_url,
+        miner_urls=list(miner_url) if miner_url else None,
         output_dir=output_dir,
         max_challenges=max_challenges,
         max_dialogues=max_dialogues,

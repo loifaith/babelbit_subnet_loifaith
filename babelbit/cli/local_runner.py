@@ -1,22 +1,27 @@
 """
-Local runner: mirrors the mainnet validator-runner flow against a local miner.
+Local runner: mirrors the mainnet validator-runner flow against local miners.
 
 Reads challenge JSON files, simulates the utterance engine's token-by-token
-revelation, calls the local miner's /predict endpoint at each step (same
+revelation, calls each local miner's /predict endpoint at each step (same
 schema as mainnet), and scores results through the production scoring pipeline.
+
+Supports multiple miners -- the same challenge is sent to every miner
+concurrently, just like mainnet.
 
 No Bittensor wallet, Chutes account, utterance engine, or S3 required.
 
-Usage (Terminal 1 -- miner):
+Usage (Terminal 1 -- miner A on port 8091):
     MINER_DEV_MODE=1 MINER_DEVICE=cpu MINER_MODEL_ID=distilgpt2 \
-        uv run python babelbit/miner/serve_miner.py
+        MINER_AXON_PORT=8091 uv run python babelbit/miner/serve_miner.py
 
-Usage (Terminal 2 -- local validator, random challenge):
-    uv run bb local-validate
+Usage (Terminal 2 -- miner B on port 8092):
+    MINER_DEV_MODE=1 MINER_DEVICE=cpu MINER_MODEL_ID=gpt2 \
+        MINER_AXON_PORT=8092 uv run python babelbit/miner/serve_miner.py
 
-Usage (Terminal 2 -- local validator, specific challenge):
+Usage (Terminal 3 -- local validator against both):
     uv run bb local-validate \
-        --challenge ../miner-test-data/en/npr/03/en-npr-003026.json
+        --miner-url http://localhost:8091 \
+        --miner-url http://localhost:8092
 """
 import asyncio
 import json
@@ -151,20 +156,32 @@ async def _call_local_predict(
 
 # ---------------------------------------------------------------------------
 # Simulate utterance engine: step through challenge data token-by-token
-# and query the local miner at every step (mirrors predict_with_utterance_engine_multi_miner)
+# and query every local miner at every step
+# (mirrors predict_with_utterance_engine_multi_miner)
 # ---------------------------------------------------------------------------
+
+async def _predict_one_miner(
+    client: httpx.AsyncClient,
+    miner_url: str,
+    payload: BBPredictedUtterance,
+    timeout: float,
+) -> Tuple[str, str]:
+    """Call a single miner and return (miner_url, prediction)."""
+    prediction = await _call_local_predict(client, miner_url, payload, timeout)
+    return miner_url, prediction
+
 
 async def _simulate_challenge(
     client: httpx.AsyncClient,
-    miner_url: str,
-    miner: Miner,
+    miners: List[Tuple[str, Miner]],
     challenge: Dict[str, Any],
     max_dialogues: Optional[int],
     timeout: float,
 ) -> Tuple[str, Dict[str, Dict[str, List[BBPredictedUtterance]]]]:
     """
     Walk every dialogue / utterance / token exactly like the mainnet runner,
-    query the miner at each step, and return the populated miner_dialogues dict.
+    query ALL miners concurrently at each step, and return the populated
+    miner_dialogues dict keyed by each miner's hotkey.
     """
     challenge_uid = challenge.get("challenge_uid", str(uuid.uuid4()))
     dialogues = challenge.get("dialogues", [])
@@ -172,10 +189,11 @@ async def _simulate_challenge(
         dialogues = dialogues[:max_dialogues]
 
     session_id = str(uuid.uuid4())
-    miner_key = miner.hotkey
+
+    url_to_miner = {url: m for url, m in miners}
 
     miner_dialogues: Dict[str, Dict[str, List[BBPredictedUtterance]]] = {
-        miner_key: {}
+        m.hotkey: {} for _, m in miners
     }
     miner_contexts: Dict[str, str] = {}
 
@@ -185,7 +203,8 @@ async def _simulate_challenge(
         if not utterances:
             continue
 
-        miner_dialogues[miner_key][dialogue_uid] = []
+        for _, m in miners:
+            miner_dialogues[m.hotkey][dialogue_uid] = []
         miner_contexts[dialogue_uid] = ""
 
         logger.info(
@@ -214,25 +233,35 @@ async def _simulate_challenge(
                     done=False,
                 )
 
-                prediction = await _call_local_predict(
-                    client, miner_url, payload, timeout
-                )
+                tasks = [
+                    _predict_one_miner(client, url, payload, timeout)
+                    for url in url_to_miner
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                step_utt = BBPredictedUtterance(
-                    index=session_id,
-                    step=step,
-                    prefix=prefix,
-                    prediction=prediction,
-                    context=context,
-                    done=False,
-                )
-                miner_dialogues[miner_key][dialogue_uid].append(step_utt)
+                for res in results:
+                    if isinstance(res, httpx.ConnectError):
+                        raise res
+                    if isinstance(res, Exception):
+                        logger.warning("Miner call failed: %s", res)
+                        continue
+                    miner_url_r, prediction = res
+                    miner_key = url_to_miner[miner_url_r].hotkey
+                    step_utt = BBPredictedUtterance(
+                        index=session_id,
+                        step=step,
+                        prefix=prefix,
+                        prediction=prediction,
+                        context=context,
+                        done=False,
+                    )
+                    miner_dialogues[miner_key][dialogue_uid].append(step_utt)
 
-            # Mark last step as done and attach ground truth (mirrors _finalize_utterance)
-            steps = miner_dialogues[miner_key][dialogue_uid]
-            if steps:
-                steps[-1].done = True
-                steps[-1].ground_truth = ground_truth
+            for _, m in miners:
+                steps = miner_dialogues[m.hotkey].get(dialogue_uid, [])
+                if steps:
+                    steps[-1].done = True
+                    steps[-1].ground_truth = ground_truth
 
             existing = miner_contexts.get(dialogue_uid, "")
             miner_contexts[dialogue_uid] = (
@@ -272,28 +301,44 @@ async def _check_miner_health(client: httpx.AsyncClient, miner_url: str) -> bool
         return False
 
 
+async def _check_all_miners_health(
+    client: httpx.AsyncClient, miner_urls: List[str],
+) -> List[str]:
+    """Health-check every miner URL. Return only the healthy ones."""
+    healthy: List[str] = []
+    for url in miner_urls:
+        if await _check_miner_health(client, url):
+            healthy.append(url)
+    return healthy
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 async def local_validate(
     challenge: Optional[str] = None,
-    miner_url: str = "http://localhost:8091",
+    miner_urls: Optional[List[str]] = None,
     output_dir: str = "local_test_output",
     max_challenges: Optional[int] = None,
     max_dialogues: Optional[int] = None,
     timeout: float = 30.0,
 ) -> int:
     """
-    Run the full local validation loop: read challenges, call the miner at
+    Run the full local validation loop: read challenges, call every miner at
     every token step, score with the production scorer, and print results.
 
     When *challenge* is None the runner automatically picks random file(s)
     from the ``miner-test-data/`` directory (defaults to 1 challenge).
 
+    *miner_urls* is a list of miner base URLs.  Defaults to
+    ``["http://localhost:8091"]`` when not provided.
+
     Returns 0 on success, 1 on error.
     """
-    miner_url = miner_url.rstrip("/")
+    if not miner_urls:
+        miner_urls = ["http://localhost:8091"]
+    miner_urls = [u.rstrip("/") for u in miner_urls]
 
     # Resolve challenge path -- auto-discover test data when not specified
     if challenge is None:
@@ -320,14 +365,22 @@ async def local_validate(
     print("=" * 64)
     print("Babelbit Local Validator (mainnet-equivalent flow)")
     print("=" * 64)
-    print(f"  Miner URL:    {miner_url}")
+    print(f"  Miners ({len(miner_urls)}):")
+    for i, u in enumerate(miner_urls):
+        print(f"    [{i}] {u}")
     print(f"  Challenge:    {challenge_path}")
     print(f"  Output dir:   {output_dir}")
     print()
 
+    # Health-check all miners, keep only healthy ones
     async with httpx.AsyncClient() as client:
-        if not await _check_miner_health(client, miner_url):
-            return 1
+        healthy_urls = await _check_all_miners_health(client, miner_urls)
+    if not healthy_urls:
+        print("Error: No healthy miners found. Aborting.", file=sys.stderr)
+        return 1
+    if len(healthy_urls) < len(miner_urls):
+        skipped = set(miner_urls) - set(healthy_urls)
+        print(f"  Warning: skipping unhealthy miners: {', '.join(skipped)}\n")
 
     files = _discover_challenge_files(challenge_path, max_challenges)
     if not files:
@@ -336,26 +389,30 @@ async def local_validate(
 
     print(f"Found {len(files)} challenge file(s)\n")
 
-    miner = _make_local_miner(miner_url)
-    miner_list = [miner]
+    # Build (url, Miner) pairs with sequential UIDs
+    miners: List[Tuple[str, Miner]] = [
+        (url, _make_local_miner(url, uid=i))
+        for i, url in enumerate(healthy_urls)
+    ]
+    miner_list = [m for _, m in miners]
 
     submission_client = ValidationSubmissionClient(enabled=False)
 
-    all_mean_scores: List[float] = []
+    # Per-miner score accumulators across all challenges
+    miner_scores_all: Dict[str, List[float]] = {m.hotkey: [] for m in miner_list}
 
     async with httpx.AsyncClient() as client:
         for fpath in files:
             data = _load_challenge(fpath)
             n_dlg = len(data.get("dialogues", []))
             cuid_preview = data.get("challenge_uid", fpath.stem)[:16]
-            print(f"Challenge {cuid_preview}…  ({n_dlg} dialogue(s))")
+            print(f"Challenge {cuid_preview}…  ({n_dlg} dialogue(s), {len(miners)} miner(s))")
             print("-" * 64)
 
             try:
                 challenge_uid, miner_dialogues = await _simulate_challenge(
                     client=client,
-                    miner_url=miner_url,
-                    miner=miner,
+                    miners=miners,
                     challenge=data,
                     max_dialogues=max_dialogues,
                     timeout=timeout,
@@ -369,7 +426,8 @@ async def local_validate(
                 for steps in dlg_steps.values()
             )
             logger.info(
-                "Challenge %s: collected %d prediction steps", challenge_uid, total_steps
+                "Challenge %s: collected %d prediction steps across %d miner(s)",
+                challenge_uid, total_steps, len(miners),
             )
 
             # --- Use the REAL production scoring pipeline from runner.py ---
@@ -387,30 +445,39 @@ async def local_validate(
             )
 
             if scores:
-                mean = sum(scores) / len(scores)
-                all_mean_scores.append(mean)
                 print(
                     f"\n  Scored {dialogues_processed} dialogue(s) "
                     f"for {miners_processed} miner(s)"
                 )
-                print(f"  Challenge mean U: {mean:.4f}")
+                for idx, (url, m) in enumerate(miners):
+                    if idx < len(scores):
+                        miner_scores_all[m.hotkey].append(scores[idx])
+                        print(f"    Miner [{idx}] {url}: U = {scores[idx]:.4f}")
             else:
                 print("  (no scores produced)")
             print()
 
+    # Final summary
     print("=" * 64)
-    if all_mean_scores:
-        overall = sum(all_mean_scores) / len(all_mean_scores)
-        print(f"Overall mean U across {len(all_mean_scores)} challenge(s): {overall:.4f}")
-    else:
-        print("No scores produced. Check warnings above.")
+    print("RESULTS SUMMARY")
+    print("=" * 64)
+    any_scores = False
+    for idx, (url, m) in enumerate(miners):
+        s = miner_scores_all[m.hotkey]
+        if s:
+            any_scores = True
+            mean = sum(s) / len(s)
+            print(f"  Miner [{idx}] {url}")
+            print(f"    Mean U across {len(s)} challenge(s): {mean:.4f}")
+    if not any_scores:
+        print("  No scores produced. Check warnings above.")
     print("=" * 64)
     return 0
 
 
 def main(
     challenge: Optional[str] = None,
-    miner_url: str = "http://localhost:8091",
+    miner_urls: Optional[List[str]] = None,
     output_dir: str = "local_test_output",
     max_challenges: Optional[int] = None,
     max_dialogues: Optional[int] = None,
@@ -420,7 +487,7 @@ def main(
     return asyncio.run(
         local_validate(
             challenge=challenge,
-            miner_url=miner_url,
+            miner_urls=miner_urls,
             output_dir=output_dir,
             max_challenges=max_challenges,
             max_dialogues=max_dialogues,
