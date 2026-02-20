@@ -20,11 +20,19 @@ if fuser "${MINER_AXON_PORT}/tcp" >/dev/null 2>&1; then
     sleep 1
 fi
 
+BACKEND_URL="${MINER_BACKEND_URL:-}"
+
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Babelbit Local Miner"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Model:   ${MINER_MODEL_ID}"
-echo "  Device:  ${MINER_DEVICE}"
+if [ -n "$BACKEND_URL" ]; then
+    echo "  Mode:    BACKEND PROXY"
+    echo "  Backend: ${BACKEND_URL}"
+else
+    echo "  Mode:    LOCAL MODEL"
+    echo "  Model:   ${MINER_MODEL_ID}"
+    echo "  Device:  ${MINER_DEVICE}"
+fi
 echo "  Port:    ${MINER_AXON_PORT}"
 echo "  DevMode: ${MINER_DEV_MODE}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

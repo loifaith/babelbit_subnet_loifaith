@@ -271,6 +271,87 @@ MINER_MODEL_ID=your-username/your-model MINER_MODEL_REVISION=v2 ./run_local_mine
 
 Compatible model families include GPT-2, LLaMA, Mistral, Phi, Qwen, and any other `AutoModelForCausalLM`-compatible architecture.
 
+### Using your own backend (proxy mode)
+
+If you have your own inference server, you can run the miner in **backend proxy mode**. The miner will forward every `/predict` request to your backend instead of loading a model locally. No GPU or model download required.
+
+Set `MINER_BACKEND_URL` to activate:
+
+```bash
+MINER_BACKEND_URL=http://localhost:5000 ./run_local_miner.sh
+```
+
+Your backend must implement a `POST /predict` endpoint that accepts this JSON body:
+
+```json
+{
+  "index": "session-uuid",
+  "step": 3,
+  "prefix": "The quick brown",
+  "context": "Previous utterance text",
+  "done": false,
+  "prediction": ""
+}
+```
+
+And return a JSON response with the predicted full utterance:
+
+```json
+{
+  "prediction": "The quick brown fox jumps over the lazy dog"
+}
+```
+
+Optionally, your backend can also expose `GET /healthz` (returning HTTP 200) for health checks.
+
+#### Minimal Flask backend example
+
+```python
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+@app.route("/predict", methods=["POST"])
+def predict():
+    data = request.json
+    prefix = data.get("prefix", "")
+    context = data.get("context", "")
+
+    # Your custom prediction logic here
+    prediction = my_model_predict(prefix, context)
+
+    return jsonify({"prediction": prediction})
+
+@app.route("/healthz")
+def health():
+    return jsonify({"status": "healthy"})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+```
+
+#### Backend environment variables
+
+| Variable | Example | Description |
+|---|---|---|
+| `MINER_BACKEND_URL` | `http://localhost:5000` | Your backend URL; activates proxy mode |
+| `MINER_BACKEND_TIMEOUT` | `30` | Request timeout in seconds (default: 30) |
+
+#### Full workflow with a custom backend
+
+```bash
+# Terminal 1: start your backend
+python my_backend.py  # serving on port 5000
+
+# Terminal 2: start the miner in proxy mode
+MINER_BACKEND_URL=http://localhost:5000 ./run_local_miner.sh
+
+# Terminal 3: run the validator
+./run_local_validator.sh
+```
+
+The validator sees the miner on port 8091 as usual -- it has no knowledge that the miner is proxying to your backend.
+
 ## 8. Quick-reference cheat sheet
 
 ### Single miner

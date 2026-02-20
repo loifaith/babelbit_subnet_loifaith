@@ -2,6 +2,12 @@
 Simple FastAPI-based miner server for Babelbit subnet.
 Serves predictions via HTTP endpoint that validators can call directly.
 
+Supports two modes:
+  1. **Model mode** (default) -- loads a HuggingFace causal-LM and runs
+     inference locally.
+  2. **Backend proxy mode** -- set ``MINER_BACKEND_URL`` to forward every
+     ``/predict`` request to your own backend API.  No model is loaded.
+
 Note: Run register_axon.py first to register your miner on-chain,
 then run this script to serve predictions.
 """
@@ -13,6 +19,7 @@ from pathlib import Path
 from traceback import format_exc
 from typing import Optional
 
+import httpx
 import torch
 from fastapi import FastAPI, HTTPException, Request, Header, status
 from pydantic import BaseModel
@@ -376,35 +383,113 @@ class BabelbitMiner:
             return PredictResponse(prediction="")
 
 
-# Global miner instance
-miner_instance: Optional[BabelbitMiner] = None
+class BackendProxyMiner:
+    """
+    Proxy miner that forwards /predict requests to a custom backend URL.
+
+    Set ``MINER_BACKEND_URL`` to activate.  The backend must accept POST
+    requests with the same JSON schema as ``PredictRequest`` and return a
+    JSON body containing at least ``{"prediction": "..."}``.
+
+    No model or GPU is required.
+    """
+
+    def __init__(self, backend_url: str, timeout: float = 30.0):
+        self.backend_url = backend_url.rstrip("/")
+        self.timeout = timeout
+        self.model_id = f"backend:{self.backend_url}"
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def load(self):
+        self._client = httpx.AsyncClient(timeout=self.timeout)
+        try:
+            resp = await self._client.get(f"{self.backend_url}/healthz")
+            if resp.status_code == 200:
+                logger.info("Backend healthy: %s", resp.json())
+            else:
+                logger.warning("Backend health check returned HTTP %s", resp.status_code)
+        except Exception as exc:
+            logger.warning("Backend health check failed: %s (will still attempt predictions)", exc)
+
+    async def predict(self, request: PredictRequest) -> PredictResponse:
+        if self._client is None:
+            await self.load()
+        body = {
+            "index": request.index,
+            "step": request.step,
+            "prefix": request.prefix,
+            "context": request.context,
+            "done": request.done,
+            "prediction": request.prediction,
+        }
+        if request.ground_truth is not None:
+            body["ground_truth"] = request.ground_truth
+        try:
+            resp = await self._client.post(
+                f"{self.backend_url}/predict", json=body,
+            )
+            if resp.status_code != 200:
+                logger.warning("Backend returned HTTP %s: %s", resp.status_code, resp.text[:200])
+                return PredictResponse(prediction="")
+            data = resp.json()
+            return PredictResponse(prediction=data.get("prediction", ""))
+        except Exception as exc:
+            logger.error("Backend call error: %s", exc)
+            return PredictResponse(prediction="")
+
+    @property
+    def _model(self):
+        """Compatibility shim so health-check code works."""
+        return self._client
+
+
+# Global miner instance (BabelbitMiner or BackendProxyMiner)
+miner_instance = None
 
 
 async def startup():
     """FastAPI startup event handler."""
     global miner_instance
-    
+
     settings = get_settings()
-    
-    # Get model configuration
+    backend_url = os.getenv("MINER_BACKEND_URL", "").strip()
+
+    if backend_url:
+        # ── Backend proxy mode ──
+        timeout = float(os.getenv("MINER_BACKEND_TIMEOUT", "30"))
+        logger.info("Mode: BACKEND PROXY")
+        logger.info(f"Backend URL: {backend_url}")
+        logger.info(f"Timeout: {timeout}s")
+        logger.info("")
+
+        miner_instance = BackendProxyMiner(backend_url=backend_url, timeout=timeout)
+        try:
+            await miner_instance.load()
+            logger.info("✅ Backend proxy ready")
+            logger.info("")
+        except Exception as e:
+            logger.error("❌ Failed to connect to backend: %s", e)
+            raise
+        return
+
+    # ── Model mode (default) ──
     model_id = settings.MINER_MODEL_ID
     revision = getattr(settings, 'MINER_MODEL_REVISION', None)
     cache_dir = settings.BABELBIT_CACHE_DIR / "models"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Quantization settings
+
     load_in_8bit = getattr(settings, 'MINER_LOAD_IN_8BIT', False)
     load_in_4bit = getattr(settings, 'MINER_LOAD_IN_4BIT', False)
     device = getattr(settings, 'MINER_DEVICE', 'cuda')
-    
+
+    logger.info("Mode: LOCAL MODEL")
     logger.info(f"Model: {model_id}")
     logger.info(f"Revision: {revision or 'main'}")
     logger.info(f"Cache dir: {cache_dir}")
     logger.info(f"Quantization: 8bit={load_in_8bit}, 4bit={load_in_4bit}")
     logger.info(f"Device: {device}")
     logger.info("")
-    
-    # Create and load miner
+
     miner_instance = BabelbitMiner(
         model_id=model_id,
         revision=revision,
@@ -413,7 +498,7 @@ async def startup():
         load_in_8bit=load_in_8bit,
         load_in_4bit=load_in_4bit,
     )
-    
+
     logger.info("Loading model...")
     try:
         await miner_instance.load()
