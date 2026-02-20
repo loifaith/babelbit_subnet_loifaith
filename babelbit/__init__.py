@@ -1,4 +1,5 @@
 import click
+import sys
 from asyncio import run
 from pathlib import Path
 from logging import getLogger, DEBUG, INFO, WARNING, basicConfig
@@ -227,6 +228,119 @@ def generate_chute_file(revision: str) -> None:
 #         click.echo(result)
 #     except Exception as e:
 #         click.echo(e)
+
+
+@cli.command("local-validate")
+@click.option(
+    "--challenge",
+    default=None,
+    help="Path to a challenge JSON file or directory. "
+    "If omitted, a random challenge is picked from miner-test-data/.",
+)
+@click.option(
+    "--miner-url",
+    default="http://localhost:8091",
+    show_default=True,
+    help="Base URL of the local miner server.",
+)
+@click.option(
+    "--output-dir",
+    default="local_test_output",
+    show_default=True,
+    help="Directory for logs and score output.",
+)
+@click.option(
+    "--max-challenges",
+    type=int,
+    default=None,
+    help="Max challenge files to process (default: 1 when auto-selecting).",
+)
+@click.option(
+    "--max-dialogues",
+    type=int,
+    default=None,
+    help="Max dialogues per challenge.",
+)
+@click.option(
+    "--timeout",
+    type=float,
+    default=30.0,
+    show_default=True,
+    help="Prediction request timeout in seconds.",
+)
+def local_validate_cmd(challenge, miner_url, output_dir, max_challenges, max_dialogues, timeout):
+    """Run the full local validator flow against a local miner (mainnet-equivalent).
+
+    When --challenge is omitted, a random challenge is automatically picked
+    from the miner-test-data/ directory.
+    """
+    from babelbit.cli.local_runner import main as run_local
+    rc = run_local(
+        challenge=challenge,
+        miner_url=miner_url,
+        output_dir=output_dir,
+        max_challenges=max_challenges,
+        max_dialogues=max_dialogues,
+        timeout=timeout,
+    )
+    sys.exit(rc)
+
+
+@cli.command("test-miner")
+@click.option(
+    "--challenge",
+    required=True,
+    help="Path to a challenge JSON file or directory of challenge files.",
+)
+@click.option(
+    "--miner-url",
+    default="http://localhost:8091",
+    show_default=True,
+    help="Base URL of the local miner server.",
+)
+@click.option(
+    "--output-dir",
+    default="local_test_output",
+    show_default=True,
+    help="Directory for JSONL logs and score output.",
+)
+@click.option(
+    "--max-challenges",
+    type=int,
+    default=None,
+    help="Max challenge files to process (random selection when given a directory).",
+)
+@click.option(
+    "--max-dialogues",
+    type=int,
+    default=None,
+    help="Max dialogues per challenge (for quick tests).",
+)
+@click.option(
+    "--timeout",
+    type=float,
+    default=30.0,
+    show_default=True,
+    help="Prediction request timeout in seconds.",
+)
+@click.option(
+    "--skip-scoring",
+    is_flag=True,
+    help="Skip scoring, only produce JSONL logs.",
+)
+def test_miner_cmd(challenge, miner_url, output_dir, max_challenges, max_dialogues, timeout, skip_scoring):
+    """Run local miner scoring test against challenge data."""
+    from babelbit.miner.tests.local_test_challenge import main as run_test
+    rc = run_test(
+        challenge=challenge,
+        miner_url=miner_url,
+        output_dir=output_dir,
+        max_challenges=max_challenges,
+        max_dialogues=max_dialogues,
+        timeout=timeout,
+        skip_scoring=skip_scoring,
+    )
+    sys.exit(rc)
 
 
 # TODO: remove this later

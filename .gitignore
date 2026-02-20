@@ -78,3 +78,4 @@ my_chute.py
 # Test artifacts (persistent for local inspection, safe to ignore)
 test_logs/
 test_scores/
+local_test_output/

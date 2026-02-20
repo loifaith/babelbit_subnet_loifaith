@@ -101,8 +101,7 @@ def load_model_and_tokenizer(
             quantization_config=quantization_config,
             trust_remote_code=True,
             dtype=torch.float16 if device == "cuda" else torch.float32,
-            force_download=False,  # Don't force redownload
-            resume_download=True,  # Resume incomplete downloads
+            force_download=False,
         )
     except Exception as e:
         error_msg = str(e)

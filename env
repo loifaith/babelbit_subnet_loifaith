@@ -1,0 +1,21 @@
+# Minimal environment for local miner testing.
+# No Bittensor wallet, Chutes, or S3 credentials required.
+#
+# Usage:
+#   cp env.test.example .env
+#   uv run python babelbit/miner/serve_miner.py
+#
+# Then in another terminal:
+#   uv run bb test-miner --challenge ../miner-test-data/en/npr/03/en-npr-003026.json
+
+# Bypass Bittensor header verification on the miner
+MINER_DEV_MODE=1
+
+# Device: 'cpu' for testing without GPU, 'cuda' for GPU
+MINER_DEVICE=cpu
+
+# Model to load -- change to any HuggingFace model ID
+MINER_MODEL_ID=distilgpt2
+
+# Port for the miner API server
+MINER_AXON_PORT=8091
