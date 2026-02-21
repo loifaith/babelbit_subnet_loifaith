@@ -100,8 +100,10 @@ class Settings(BaseModel):
 
 
 @lru_cache
-def get_settings() -> Settings:
-    load_dotenv()
+def get_settings(env_file: Optional[str] = ".env") -> Settings:
+    # When an explicit env file is requested (e.g. --envfile .env.other), override
+    # existing env vars so that file takes effect even if .env was loaded earlier.
+    load_dotenv(env_file, override=(env_file != ".env"))
     return Settings(
         # Bittensor settings
         BITTENSOR_WALLET_COLD=getenv("BITTENSOR_WALLET_COLD", "default"),

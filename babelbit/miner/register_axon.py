@@ -12,14 +12,14 @@ from babelbit.utils.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
-def register_axon(external_ip_override=None):
+def register_axon(external_ip_override=None, env_file=None):
     """Register the miner's axon on-chain."""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    settings = get_settings()
+    settings = get_settings(env_file) if env_file else get_settings()
     
     # Get wallet configuration
     wallet_name = settings.BITTENSOR_WALLET_COLD
@@ -100,6 +100,9 @@ if __name__ == "__main__":
 Examples:
   # Register with IP from settings/env
   python babelbit/miner/register_axon.py
+
+  # Use a specific env file
+  python babelbit/miner/register_axon.py --envfile .env.other
   
   # Register with specific external IP
   python babelbit/miner/register_axon.py --external-ip x.x.x.x
@@ -109,6 +112,13 @@ Examples:
         """,
         add_help=True,
         allow_abbrev=False
+    )
+    parser.add_argument(
+        "--envfile",
+        type=str,
+        metavar="PATH",
+        help="Path to env file (default: .env from get_settings)",
+        default=None,
     )
     parser.add_argument(
         "--external-ip",
@@ -125,4 +135,4 @@ Examples:
         parser.print_help()
         exit(0)
     
-    register_axon(external_ip_override=args.external_ip)
+    register_axon(external_ip_override=args.external_ip, env_file=args.envfile)

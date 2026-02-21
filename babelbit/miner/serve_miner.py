@@ -2,24 +2,23 @@
 Simple FastAPI-based miner server for Babelbit subnet.
 Serves predictions via HTTP endpoint that validators can call directly.
 
-Supports two modes:
-  1. **Model mode** (default) -- loads a HuggingFace causal-LM and runs
-     inference locally.
-  2. **Backend proxy mode** -- set ``MINER_BACKEND_URL`` to forward every
-     ``/predict`` request to your own backend API.  No model is loaded.
-
 Note: Run register_axon.py first to register your miner on-chain,
 then run this script to serve predictions.
 """
 import asyncio
+import json
 import logging
 import os
+import re
+import socket
 import time
+from datetime import datetime
 from pathlib import Path
 from traceback import format_exc
 from typing import Optional
+from urllib.request import urlopen
+from urllib.error import URLError
 
-import httpx
 import torch
 from fastapi import FastAPI, HTTPException, Request, Header, status
 from pydantic import BaseModel
@@ -37,6 +36,31 @@ logger = logging.getLogger(__name__)
 _PROMPT_CACHE: dict[str, torch.Tensor] = {}
 _MINER_HOTKEY_SS58: Optional[str] = None
 
+# Optional path for per-step prediction logging (hotkey name is appended when writing)
+_PREDICTION_LOG_PATH = os.getenv("MINER_PREDICTION_LOG", "miner_predictions.jsonl")
+# Env file path from CLI (--envfile); used by get_settings() in this module
+_ENV_FILE: Optional[str] = None
+
+
+def _prediction_log_path_with_hotkey() -> str:
+    """Return _PREDICTION_LOG_PATH with hotkey name appended before the extension (e.g. miner_predictions_default.jsonl)."""
+    base = _PREDICTION_LOG_PATH
+    hotkey_name = "unknown"
+    try:
+        hotkey_name = _settings().BITTENSOR_WALLET_HOT or "unknown"
+    except Exception:
+        pass
+    # Safe for filenames: replace path separators and spaces
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(hotkey_name))
+    if not safe:
+        safe = "unknown"
+    root, ext = os.path.splitext(base)
+    return f"{root}_{safe}{ext}"
+
+
+def _settings():
+    """Settings loaded from _ENV_FILE when set (CLI --envfile)."""
+    return get_settings(_ENV_FILE) if _ENV_FILE else get_settings()
 
 def _get_miner_hotkey_ss58() -> Optional[str]:
     """Load and cache this miner's hotkey SS58 address."""
@@ -44,7 +68,7 @@ def _get_miner_hotkey_ss58() -> Optional[str]:
     if _MINER_HOTKEY_SS58:
         return _MINER_HOTKEY_SS58
     try:
-        settings = get_settings()
+        settings = _settings()
         keypair = load_hotkey_keypair(settings.BITTENSOR_WALLET_COLD, settings.BITTENSOR_WALLET_HOT)
         _MINER_HOTKEY_SS58 = keypair.ss58_address
         return _MINER_HOTKEY_SS58
@@ -139,6 +163,17 @@ class BabelbitMiner:
             return float(os.getenv(name, str(default)))
         except Exception:
             return default
+
+    def _use_chat_template(self) -> bool:
+        """Whether to use the tokenizer's chat template. Base models (e.g. Llama-3.1-8B) should not."""
+        raw = os.getenv("CHUTE_USE_CHAT_TEMPLATE", "").strip().lower()
+        if raw in ("0", "false", "no"):
+            return False
+        if raw in ("1", "true", "yes"):
+            return True
+        # Auto-detect: only use chat template for Instruct/Chat-tuned models
+        model_lower = (self.model_id or "").lower()
+        return "instruct" in model_lower or "chat" in model_lower
     
     def _prepare_inputs(self, prompt: str) -> torch.Tensor:
         """Tokenize prompt with caching of static system+instruction part."""
@@ -230,24 +265,31 @@ class BabelbitMiner:
                 logger.warning("No prefix provided, returning empty prediction")
                 return PredictResponse(prediction="")
             
-            logger.info(f"Generating prediction for prefix: '{request.prefix}'")
-            logger.info(f"Using context: '{request.context}'")
-            
-            # Create prompt similar to the chute template
-            system_msg = (
-                "You are a helpful assistant that completes the current utterance naturally and succinctly. "
-                "Return only the completed utterance text without quotes or extra commentary."
-            )
-            
-            # Build the prompt with context and prefix
+            logger.info(f"Generating prediction for prefix: '{request.prefix[:60]}{'...' if len(request.prefix) > 60 else ''}'")
             if request.context:
-                user_msg = f"Context:\n{request.context}\n\nContinue the utterance that begins with:\n{request.prefix}"
-            else:
-                user_msg = f"Continue the utterance that begins with:\n{request.prefix}"
+                _ctx_preview = request.context[:80] + "..." if len(request.context) > 80 else request.context
+                logger.info("Using context: %s chars (%s)", len(request.context), _ctx_preview.replace("%", "%%"))
             
-            # Use chat template if available
+            # Sanitize script-style metadata from context (e.g. "(as Character)", "(as Self)")
+            context = request.context
+            if context:
+                context = re.sub(r"\s*\(as\s+[^)]+\)", "", context)
+                context = context.strip()
+            
+            # Use chat template only for Instruct/Chat models; base models (e.g. Llama-3.1-8B)
+            # are not trained on chat format, so we use a plain continuation prompt instead.
+            use_chat_template = self._use_chat_template()
             try:
-                if hasattr(self._tokenizer, 'apply_chat_template'):
+                if use_chat_template and hasattr(self._tokenizer, 'apply_chat_template'):
+                    # Instruct/Chat models: use instruction + chat template
+                    system_msg = (
+                        "You are a helpful assistant that completes the current utterance naturally and succinctly. "
+                        "Return only the completed utterance text without quotes or extra commentary."
+                    )
+                    if context:
+                        user_msg = f"Context:\n{context}\n\nContinue the utterance that begins with:\n{request.prefix}"
+                    else:
+                        user_msg = f"Continue the utterance that begins with:\n{request.prefix}"
                     messages = [
                         {"role": "system", "content": system_msg},
                         {"role": "user", "content": user_msg},
@@ -256,8 +298,11 @@ class BabelbitMiner:
                         messages, tokenize=False, add_generation_prompt=True
                     )
                 else:
-                    # Fallback for models without chat template
-                    prompt = f"System: {system_msg}\n\nUser: {user_msg}\n\nAssistant:"
+                    # Base completion models: prompt = text to continue (predict words after prefix)
+                    if context:
+                        prompt = f"Context:\n{context}\n\n{request.prefix}"
+                    else:
+                        prompt = request.prefix
             except Exception:
                 # Simple fallback if chat template fails
                 prompt = f"{request.prefix}"
@@ -285,9 +330,9 @@ class BabelbitMiner:
                 # Validate input tensor
                 if inputs.dim() != 2 or inputs.size(0) != 1:
                     raise ValueError(f"Invalid input tensor shape: {inputs.shape}")
-                
-                vocab_size = getattr(self._tokenizer, 'vocab_size', 50000)
-                if torch.any(inputs >= vocab_size) or torch.any(inputs < 0):
+                # Use len(tokenizer) not vocab_size: Llama etc. have added/special tokens with IDs >= vocab_size
+                max_token_id = len(self._tokenizer) - 1
+                if torch.any(inputs > max_token_id) or torch.any(inputs < 0):
                     raise ValueError("Input contains invalid token IDs")
                     
             except Exception as e:
@@ -373,6 +418,29 @@ class BabelbitMiner:
             full_prediction = request.prefix + ' ' + prediction
             
             logger.info(f"Generated: {full_prediction[:100]}...")
+
+            # Log per-step prediction to external file (JSONL)
+            try:
+                log_record = {
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "index": request.index,
+                    "step": request.step,
+                    "done": request.done,
+                    "prefix": request.prefix,
+                    "context": request.context,
+                    "ground_truth": request.ground_truth,
+                    "raw_prediction": prediction,
+                    "full_prediction": full_prediction,
+                }
+                # Include evaluation details if available
+                if request.evaluation is not None:
+                    log_record["evaluation"] = request.evaluation.model_dump()
+
+                log_path = _prediction_log_path_with_hotkey()
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+            except Exception as log_err:
+                logger.error(f"Failed to write prediction log: {log_err}")
             
             return PredictResponse(prediction=full_prediction)
             
@@ -383,113 +451,35 @@ class BabelbitMiner:
             return PredictResponse(prediction="")
 
 
-class BackendProxyMiner:
-    """
-    Proxy miner that forwards /predict requests to a custom backend URL.
-
-    Set ``MINER_BACKEND_URL`` to activate.  The backend must accept POST
-    requests with the same JSON schema as ``PredictRequest`` and return a
-    JSON body containing at least ``{"prediction": "..."}``.
-
-    No model or GPU is required.
-    """
-
-    def __init__(self, backend_url: str, timeout: float = 30.0):
-        self.backend_url = backend_url.rstrip("/")
-        self.timeout = timeout
-        self.model_id = f"backend:{self.backend_url}"
-        self._client: Optional[httpx.AsyncClient] = None
-
-    async def load(self):
-        self._client = httpx.AsyncClient(timeout=self.timeout)
-        try:
-            resp = await self._client.get(f"{self.backend_url}/healthz")
-            if resp.status_code == 200:
-                logger.info("Backend healthy: %s", resp.json())
-            else:
-                logger.warning("Backend health check returned HTTP %s", resp.status_code)
-        except Exception as exc:
-            logger.warning("Backend health check failed: %s (will still attempt predictions)", exc)
-
-    async def predict(self, request: PredictRequest) -> PredictResponse:
-        if self._client is None:
-            await self.load()
-        body = {
-            "index": request.index,
-            "step": request.step,
-            "prefix": request.prefix,
-            "context": request.context,
-            "done": request.done,
-            "prediction": request.prediction,
-        }
-        if request.ground_truth is not None:
-            body["ground_truth"] = request.ground_truth
-        try:
-            resp = await self._client.post(
-                f"{self.backend_url}/predict", json=body,
-            )
-            if resp.status_code != 200:
-                logger.warning("Backend returned HTTP %s: %s", resp.status_code, resp.text[:200])
-                return PredictResponse(prediction="")
-            data = resp.json()
-            return PredictResponse(prediction=data.get("prediction", ""))
-        except Exception as exc:
-            logger.error("Backend call error: %s", exc)
-            return PredictResponse(prediction="")
-
-    @property
-    def _model(self):
-        """Compatibility shim so health-check code works."""
-        return self._client
-
-
-# Global miner instance (BabelbitMiner or BackendProxyMiner)
-miner_instance = None
+# Global miner instance
+miner_instance: Optional[BabelbitMiner] = None
 
 
 async def startup():
     """FastAPI startup event handler."""
     global miner_instance
-
-    settings = get_settings()
-    backend_url = os.getenv("MINER_BACKEND_URL", "").strip()
-
-    if backend_url:
-        # ── Backend proxy mode ──
-        timeout = float(os.getenv("MINER_BACKEND_TIMEOUT", "30"))
-        logger.info("Mode: BACKEND PROXY")
-        logger.info(f"Backend URL: {backend_url}")
-        logger.info(f"Timeout: {timeout}s")
-        logger.info("")
-
-        miner_instance = BackendProxyMiner(backend_url=backend_url, timeout=timeout)
-        try:
-            await miner_instance.load()
-            logger.info("✅ Backend proxy ready")
-            logger.info("")
-        except Exception as e:
-            logger.error("❌ Failed to connect to backend: %s", e)
-            raise
-        return
-
-    # ── Model mode (default) ──
+    
+    settings = _settings()
+    
+    # Get model configuration
     model_id = settings.MINER_MODEL_ID
     revision = getattr(settings, 'MINER_MODEL_REVISION', None)
     cache_dir = settings.BABELBIT_CACHE_DIR / "models"
     cache_dir.mkdir(parents=True, exist_ok=True)
-
+    
+    # Quantization settings
     load_in_8bit = getattr(settings, 'MINER_LOAD_IN_8BIT', False)
     load_in_4bit = getattr(settings, 'MINER_LOAD_IN_4BIT', False)
     device = getattr(settings, 'MINER_DEVICE', 'cuda')
-
-    logger.info("Mode: LOCAL MODEL")
+    
     logger.info(f"Model: {model_id}")
     logger.info(f"Revision: {revision or 'main'}")
     logger.info(f"Cache dir: {cache_dir}")
     logger.info(f"Quantization: 8bit={load_in_8bit}, 4bit={load_in_4bit}")
     logger.info(f"Device: {device}")
     logger.info("")
-
+    
+    # Create and load miner
     miner_instance = BabelbitMiner(
         model_id=model_id,
         revision=revision,
@@ -498,7 +488,7 @@ async def startup():
         load_in_8bit=load_in_8bit,
         load_in_4bit=load_in_4bit,
     )
-
+    
     logger.info("Loading model...")
     try:
         await miner_instance.load()
@@ -557,7 +547,7 @@ async def predict_endpoint(
         raise HTTPException(status_code=503, detail="Miner not initialized")
     
     # Check if dev mode is enabled (bypass verification)
-    settings = get_settings()
+    settings = _settings()
     dev_mode = getattr(settings, "MINER_DEV_MODE", False) or os.getenv("MINER_DEV_MODE", "0") in ("1", "true", "True")
     
     if dev_mode:
@@ -625,7 +615,7 @@ async def predict_endpoint(
         logger.info(f"✅ Verified request from validator: {dendrite_hotkey[:8]}...")
     else:
         # Non-Bittensor request - check dev mode
-        settings = get_settings()
+        settings = _settings()
         dev_mode = getattr(settings, "MINER_DEV_MODE", False) or os.getenv("MINER_DEV_MODE", "0") in ("1", "true", "True")
         
         if not dev_mode:
@@ -651,7 +641,7 @@ async def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    settings = get_settings()
+    settings = _settings()
     axon_port = settings.MINER_AXON_PORT
     
     logger.info("=" * 60)
@@ -694,4 +684,18 @@ async def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Miner from log (model for step 0,1; log lookup from step 2)",
+    )
+    parser.add_argument(
+        "--envfile",
+        type=str,
+        metavar="PATH",
+        help="Path to env file (default: .env)",
+        default=None,
+    )
+    args = parser.parse_args()
+    if args.envfile:
+        globals()["_ENV_FILE"] = args.envfile
     asyncio.run(main())
