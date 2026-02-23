@@ -25,6 +25,8 @@ from pydantic import BaseModel
 import uvicorn
 from substrateinterface import Keypair
 
+from openai import OpenAI
+
 from babelbit.miner.model_loader import load_model_and_tokenizer
 from babelbit.miner.utils import verify_bittensor_request
 from babelbit.utils.bittensor_helpers import load_hotkey_keypair
@@ -61,6 +63,38 @@ def _prediction_log_path_with_hotkey() -> str:
 def _settings():
     """Settings loaded from _ENV_FILE when set (CLI --envfile)."""
     return get_settings(_ENV_FILE) if _ENV_FILE else get_settings()
+
+
+def _get_backend_url() -> Optional[str]:
+    """BACKEND_URL (or MINER_BACKEND_URL) from env file pointed by --envfile."""
+    _settings()  # ensure env file is loaded
+    url = (os.getenv("BACKEND_URL") or os.getenv("MINER_BACKEND_URL") or "").strip()
+    return url or None
+
+
+def predict_via_backend(
+    backend_url: str,
+    prompt: str,
+    max_tokens: int = 24,
+    model: Optional[str] = None,
+) -> str:
+    """
+    Call an OpenAI-compatible completion API (e.g. SGLang) at backend_url.
+    Returns the completion text only (no prefix).
+    """
+    base = backend_url.rstrip("/")
+    if not base.endswith("/v1"):
+        base = f"{base}/v1"
+    client = OpenAI(api_key="cpk_61697c3eeca84f3b8be5007365b561b3.4f3dc67df0ac5df49ec8ccb04b719490.k7ndwuvjSB5Mfu4cZR6tlbU44jn8J0tt", base_url=base)
+    model_name = model or os.getenv("BACKEND_MODEL", "Qwen/Qwen3-235B-A22B-Instruct-2507")
+    response = client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=max_tokens,
+    )
+    text = (response.choices[0].text or "").strip()
+    return text
+
 
 def _get_miner_hotkey_ss58() -> Optional[str]:
     """Load and cache this miner's hotkey SS58 address."""
@@ -264,7 +298,52 @@ class BabelbitMiner:
             if not request.prefix:
                 logger.warning("No prefix provided, returning empty prediction")
                 return PredictResponse(prediction="")
-            
+
+            backend_url = _get_backend_url()
+            if backend_url:
+                # Use OpenAI-compatible backend (e.g. SGLang) instead of local model
+                context = request.context
+                if context:
+                    context = re.sub(r"\s*\(as\s+[^)]+\)", "", context).strip()
+                if context:
+                    prompt = f"Context:\n{context}\n\nContinue the utterance that begins with:\n{request.prefix}"
+                else:
+                    prompt = f"Continue the utterance that begins with:\n{request.prefix}"
+                max_new_tokens = self._get_env_int("CHUTE_MAX_NEW_TOKENS", 24)
+                try:
+                    completion = await asyncio.to_thread(
+                        predict_via_backend,
+                        backend_url,
+                        prompt,
+                        max_tokens=max_new_tokens,
+                    )
+                except Exception as e:
+                    logger.error(f"Backend request failed: {e}")
+                    completion = os.getenv("CHUTE_FALLBACK_COMPLETION", "...")
+                full_prediction = request.prefix + " " + (completion or "").strip()
+                if not (completion or "").strip():
+                    full_prediction = request.prefix + " " + os.getenv("CHUTE_FALLBACK_COMPLETION", "...")
+                logger.info(f"Backend generated: {full_prediction[:100]}...")
+                try:
+                    log_record = {
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "index": request.index,
+                        "step": request.step,
+                        "done": request.done,
+                        "prefix": request.prefix,
+                        "context": request.context,
+                        "ground_truth": request.ground_truth,
+                        "raw_prediction": completion or "",
+                        "full_prediction": full_prediction,
+                    }
+                    if request.evaluation is not None:
+                        log_record["evaluation"] = request.evaluation.model_dump()
+                    with open(_prediction_log_path_with_hotkey(), "a", encoding="utf-8") as f:
+                        f.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+                except Exception as log_err:
+                    logger.error(f"Failed to write prediction log: {log_err}")
+                return PredictResponse(prediction=full_prediction)
+
             logger.info(f"Generating prediction for prefix: '{request.prefix[:60]}{'...' if len(request.prefix) > 60 else ''}'")
             if request.context:
                 _ctx_preview = request.context[:80] + "..." if len(request.context) > 80 else request.context
@@ -478,7 +557,12 @@ async def startup():
     logger.info(f"Quantization: 8bit={load_in_8bit}, 4bit={load_in_4bit}")
     logger.info(f"Device: {device}")
     logger.info("")
-    
+
+    backend_url = _get_backend_url()
+    if backend_url:
+        logger.info(f"Using backend URL: {backend_url} (skipping local model load)")
+        logger.info("")
+
     # Create and load miner
     miner_instance = BabelbitMiner(
         model_id=model_id,
@@ -488,22 +572,26 @@ async def startup():
         load_in_8bit=load_in_8bit,
         load_in_4bit=load_in_4bit,
     )
-    
-    logger.info("Loading model...")
-    try:
-        await miner_instance.load()
-        logger.info("✅ Model loaded successfully")
+
+    if not backend_url:
+        logger.info("Loading model...")
+        try:
+            await miner_instance.load()
+            logger.info("✅ Model loaded successfully")
+            logger.info("")
+        except Exception as e:
+            logger.error("❌ Failed to load model!")
+            logger.error(f"   Error: {e}")
+            logger.error("")
+            logger.error("Common fixes:")
+            logger.error("  1. For gated models (Llama, etc): Set HF_TOKEN environment variable")
+            logger.error("     export HF_TOKEN=your_huggingface_token")
+            logger.error("  2. Check model ID is correct and you have access")
+            logger.error("  3. Ensure you have enough disk space and RAM/VRAM")
+            raise
+    else:
+        logger.info("✅ Backend mode: predictions will use remote API")
         logger.info("")
-    except Exception as e:
-        logger.error("❌ Failed to load model!")
-        logger.error(f"   Error: {e}")
-        logger.error("")
-        logger.error("Common fixes:")
-        logger.error("  1. For gated models (Llama, etc): Set HF_TOKEN environment variable")
-        logger.error("     export HF_TOKEN=your_huggingface_token")
-        logger.error("  2. Check model ID is correct and you have access")
-        logger.error("  3. Ensure you have enough disk space and RAM/VRAM")
-        raise
 
 
 # Create FastAPI app

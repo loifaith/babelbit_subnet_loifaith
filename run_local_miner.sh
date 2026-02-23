@@ -9,9 +9,8 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────
 
 export MINER_DEV_MODE="${MINER_DEV_MODE:-1}"
-export MINER_DEVICE="${MINER_DEVICE:-cpu}"
-export MINER_MODEL_ID="${MINER_MODEL_ID:-distilgpt2}"
-export MINER_AXON_PORT="${MINER_AXON_PORT:-8091}"
+export MINER_AXON_PORT="${MINER_AXON_PORT:-8095}"
+export MINER_BACKEND_URL="${MINER_BACKEND_URL:-http://65.108.33.75:18000}"
 
 # Kill any leftover process on the target port
 if fuser "${MINER_AXON_PORT}/tcp" >/dev/null 2>&1; then
